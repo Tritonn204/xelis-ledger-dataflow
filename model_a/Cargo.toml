@@ -1,0 +1,9 @@
+[package]
+name = "model_a"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+curve25519-dalek = { git = "https://github.com/xelis-project/curve25519-dalek", branch = "master" }
+rand = "0.8"
+sha2 = "0.10"
