@@ -175,32 +175,54 @@ pub fn debug_roundtrip_transfer_payload(
 pub fn canonical_roundtrip_bytes_with_ct_verbose(
     skel: &crate::types::TxSkeleton,
     ct_proofs: Vec<CiphertextValidityProof>,
-) -> Result<Vec<u8>> {
-    use xelis_common::{account::Nonce, crypto::Signature};
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    use anyhow::{bail, Context, Result};
+    use xelis_common::{
+        account::Nonce,
+        crypto::Signature,
+        serializer::{Reader, Writer, Serializer},
+        transaction::{
+            builder::UnsignedTransaction,
+            Reference as XReference,
+            Transaction, TransactionType, TransferPayload, TxVersion,
+        },
+    };
+    use curve25519_dalek::Scalar;
 
     if ct_proofs.len() != skel.data_transfers.len() {
-        bail!("ct_proofs len mismatch (got {}, need {})", ct_proofs.len(), skel.data_transfers.len());
+        bail!(
+            "ct_proofs len mismatch (got {}, need {})",
+            ct_proofs.len(),
+            skel.data_transfers.len()
+        );
     }
 
-    // A) Prove single CT proof object round-trips
+    // A) Prove single CT proof object round-trips by itself
     debug_roundtrip_ct_proof(&ct_proofs[0]).context("CT proof[0] self round-trip failed")?;
 
-    // B) Prove first transfer payload round-trips
+    // B) Prove a TransferPayload with a CT proof round-trips
     let t0 = &skel.data_transfers[0];
     debug_roundtrip_transfer_payload(
-        &t0.asset, &t0.destination, &t0.commitment, &t0.sender_handle, &t0.receiver_handle, ct_proofs[0].clone()
-    ).context("TransferPayload[0] round-trip failed")?;
+        &t0.asset,
+        &t0.destination,
+        &t0.commitment,
+        &t0.sender_handle,
+        &t0.receiver_handle,
+        ct_proofs[0].clone(),
+    )
+    .context("TransferPayload[0] round-trip failed")?;
 
-    // C) Build transfers for the TX using the proof objects
-    let transfers: Vec<TransferPayload> = skel
+    // C) Build transfers twice (once for TX, once for Unsigned), reusing the same proofs.
+    //    We don't consume ct_proofs; we iterate by reference and clone each proof.
+    let transfers_tx: Vec<TransferPayload> = skel
         .data_transfers
         .iter()
-        .zip(ct_proofs.into_iter())
+        .zip(ct_proofs.iter().cloned())
         .map(|(t, proof)| {
             TransferPayload::new(
                 hash32(&t.asset),
                 comp_pk(&t.destination),
-                None,
+                /* extra_data */ None,
                 comp_commitment(&t.commitment),
                 comp_handle(&t.sender_handle),
                 comp_handle(&t.receiver_handle),
@@ -209,43 +231,94 @@ pub fn canonical_roundtrip_bytes_with_ct_verbose(
         })
         .collect();
 
-    // D) Add exactly one placeholder SourceCommitment so Transaction::read passes size checks
+    let transfers_unsigned: Vec<TransferPayload> = skel
+        .data_transfers
+        .iter()
+        .zip(ct_proofs.iter().cloned())
+        .map(|(t, proof)| {
+            TransferPayload::new(
+                hash32(&t.asset),
+                comp_pk(&t.destination),
+                /* extra_data */ None,
+                comp_commitment(&t.commitment),
+                comp_handle(&t.sender_handle),
+                comp_handle(&t.receiver_handle),
+                proof,
+            )
+        })
+        .collect();
+
+    // D) Add one placeholder SourceCommitment so Transaction::read passes size checks
     let mut scs = Vec::with_capacity(1);
-    let first_asset = skel.data_transfers.first().map(|t| t.asset).unwrap_or([0u8;32]);
+    let first_asset = skel
+        .data_transfers
+        .first()
+        .map(|t| t.asset)
+        .unwrap_or([0u8; 32]);
     scs.push(dummy_source_commitment(&first_asset));
 
-    // E) Build Transaction
+    // E) Build the Transaction (with placeholder Signature)
     let tx = Transaction::new(
         TxVersion::V1,
         comp_pk(&skel.source),
-        TransactionType::Transfers(transfers),
+        TransactionType::Transfers(transfers_tx),
         skel.fee,
         Nonce::from(skel.nonce),
-        scs, // <-- at least one SC
+        scs.clone(),
         range_proof_from_bytes(&skel.range_proof),
-        XReference { hash: hash32(&skel.reference.hash), topoheight: skel.reference.topoheight },
+        XReference {
+            hash: hash32(&skel.reference.hash),
+            topoheight: skel.reference.topoheight,
+        },
         None,
         Signature::new(Scalar::ZERO, Scalar::ZERO),
     );
 
     // F) Serialize TX
-    let mut bytes = Vec::new();
-    { let mut w = Writer::new(&mut bytes); tx.write(&mut w); }
-    println!("TX serialize ok ({} bytes)", bytes.len());
+    let mut tx_bytes = Vec::new();
+    {
+        let mut w = Writer::new(&mut tx_bytes);
+        tx.write(&mut w);
+    }
+    println!("TX serialize ok ({} bytes)", tx_bytes.len());
 
-    // G) Read TX (push version into context just to be safe)
-    let mut r = Reader::new(bytes.as_slice());
+    // G) Read TX (push version just to be safe), then re-serialize and compare
+    let mut r = Reader::new(tx_bytes.as_slice());
     r.context_mut().store(TxVersion::V1);
     let parsed = Transaction::read(&mut r).context("Transaction::read")?;
     println!("TX read ok");
 
-    // H) Re-serialize parsed and compare
-    let mut bytes2 = Vec::new();
-    { let mut w2 = Writer::new(&mut bytes2); parsed.write(&mut w2); }
-    println!("TX re-serialize ok ({} bytes)", bytes2.len());
-
-    if bytes != bytes2 {
+    let mut tx_bytes2 = Vec::new();
+    {
+        let mut w2 = Writer::new(&mut tx_bytes2);
+        parsed.write(&mut w2);
+    }
+    println!("TX re-serialize ok ({} bytes)", tx_bytes2.len());
+    if tx_bytes != tx_bytes2 {
         bail!("canonical re-serialize mismatch");
     }
-    Ok(bytes)
+
+    // H) Build the UnsignedTransaction (expected device preimage in many designs)
+    //    UnsignedTransaction::new expects a CompressedPublicKey for 'source';
+    //    we already operate on 32-byte compressed keys, so reuse comp_pk(..).
+    let unsigned = UnsignedTransaction::new(
+        TxVersion::V1,
+        comp_pk(&skel.source),
+        TransactionType::Transfers(transfers_unsigned),
+        skel.fee,
+        Nonce::from(skel.nonce),
+        scs,
+        XReference {
+            hash: hash32(&skel.reference.hash),
+            topoheight: skel.reference.topoheight,
+        },
+        range_proof_from_bytes(&skel.range_proof),
+    );
+
+    // I) Serialize UnsignedTransaction (this is the typical device preimage)
+    let unsigned_bytes = unsigned.to_bytes();
+    println!("Unsigned serialize ok ({} bytes)", unsigned_bytes.len());
+
+    // Return (unsigned_bytes, tx_bytes)
+    Ok((unsigned_bytes, tx_bytes))
 }

@@ -2,6 +2,16 @@ use debugger::{types::*, host_builder::build_tx_skeleton_host, ledger_checks::*,
 use debugger::proofs_host::{fill_ct_validity_proofs, build_ct_validity_proofs};
 use debugger::canonical::{canonical_roundtrip_bytes_with_ct, canonical_roundtrip_bytes_with_ct_verbose};
 
+use std::fs;
+use std::path::Path;
+
+/// Write bytes to a file (create parent dirs if needed)
+fn dump_bytes(path: &str, bytes: &[u8]) {
+    if let Some(parent) = Path::new(path).parent() { let _ = fs::create_dir_all(parent); }
+    fs::write(path, bytes).expect("write dump");
+    println!("wrote {}", path);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Demo key material (valid compressed Ristretto pubkeys).
 // In a real wallet:
@@ -84,6 +94,7 @@ fn main() {
     //       to “attest” to what it’s about to sign (optional).
     // ─────────────────────────────────────────────────────────────────────────
     let amounts: Vec<u64> = transfers.iter().map(|t| t.amount).collect();
+    let commitments: Vec<[u8; 32]> = skel.data_transfers.iter().map(|t| t.commitment).collect();
 
     // This mirrors the *on-device* attestation you’ll do before signing:
     let ok = verify_outputs_match_commitments(&skel, &amounts);
@@ -135,18 +146,24 @@ fn main() {
     // This proves the host can produce the exact blob the Ledger should sign.
     // ─────────────────────────────────────────────────────────────────────────
     match canonical_roundtrip_bytes_with_ct_verbose(&skel, ct_objs) {
-        Ok(bytes) => {
-            println!("Canonical pre-sig bytes: {}", bytes.len());
+        Ok((unsigned_bytes, tx_bytes)) => {
+            // preferred preimage for the Ledger (if your firmware signs unsigned)
+            println!("Canonical pre-sig (UNSIGNED) bytes: {}", unsigned_bytes.len());
+            println!(
+                "Debug checksum UNSIGNED (BLAKE3): {}",
+                hex::encode(blake3::hash(&unsigned_bytes).as_bytes())
+            );
 
-            // ─────────────────────────────────────────────────────────────────
-            // [LEDGER] The device receives exactly `bytes` (or its hash),
-            // displays human-readable fields (amounts, fee, destinations),
-            // and signs the canonical preimage with the spend key.
-            //
-            // → The host then inserts the signature into the `Transaction`
-            //   and broadcasts to the daemon.
-            // ─────────────────────────────────────────────────────────────────
-            println!("Canonical digest (BLAKE3 over pre-sig): {}", hex::encode(blake3::hash(&bytes).as_bytes()));
+            // full Transaction bytes (has placeholder signature field)
+            println!("Canonical TRANSACTION bytes: {}", tx_bytes.len());
+            println!(
+                "Debug checksum TX (BLAKE3): {}",
+                hex::encode(blake3::hash(&tx_bytes).as_bytes())
+            );
+
+            // (optional) dump to files for your Python streamer
+            dump_bytes("out/poc_tx.unsigned.bin", &unsigned_bytes);
+            dump_bytes("out/poc_tx.transaction.bin", &tx_bytes);
         }
         Err(e) => eprintln!("Canonical round-trip (verbose): {e:#}"),
     }
