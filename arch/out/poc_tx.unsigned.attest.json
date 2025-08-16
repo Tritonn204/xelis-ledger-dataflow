@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "timestamp": 1755386904,
+  "bip32_path": "m/44'/587'/0'/0/0",
+  "device_pubkey_hex": "6a1311c52b47503b079f38bb9b20b762029a106c455d1291c8ec3db43fade772",
+  "tx_len": 1729,
+  "tx_sha3_512_hex": "c2a3326452d233050dca6d4e6cf0718610fbd03b14868b21a038b4c4b7e129f6c64c52cb131e4757fc1cc5311ea1d795f2129e123a4e44ef1d911100e2ea5257",
+  "signature": {
+    "concat_hex": "0074d3cbd9d723c6f2db5d1d93b12ec55803f2d48d1fdbdaed5c13dae9262d01d82ab0fd89dbd25856b40cd7cad1f5e301ffb11e7e8f2515054306d330320500",
+    "s_hex": "0074d3cbd9d723c6f2db5d1d93b12ec55803f2d48d1fdbdaed5c13dae9262d01",
+    "e_hex": "d82ab0fd89dbd25856b40cd7cad1f5e301ffb11e7e8f2515054306d330320500"
+  },
+  "blinders_count": 2
+}

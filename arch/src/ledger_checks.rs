@@ -1,7 +1,7 @@
 use bulletproofs::{BulletproofGens, PedersenGens, RangeProof};
 use curve25519_dalek::{scalar::Scalar, ristretto::CompressedRistretto};
 use merlin::Transcript;
-use blake3;
+use sha2::{Digest, Sha512};
 use crate::types::*;
 
 /// Device recomputes commitments + validates compressed points.
@@ -44,8 +44,8 @@ pub fn verify_range_proof_bytes(range_proof_bytes: &[u8], commitments: &[[u8;32]
 
 /// Bind signature to semantics + proof bytes (demo digest).
 /// Later, replace with canonical XELIS serialization via xelis_common::serializer.
-pub fn digest_for_signing_demo(skel: &TxSkeleton) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
+pub fn digest_for_signing_demo(skel: &TxSkeleton) -> [u8; 64] {
+    let mut hasher = Sha512::new();
     hasher.update(&skel.source);
     hasher.update(&skel.reference.hash);
     hasher.update(&skel.reference.topoheight.to_le_bytes());

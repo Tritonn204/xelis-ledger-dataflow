@@ -322,3 +322,83 @@ pub fn canonical_roundtrip_bytes_with_ct_verbose(
     // Return (unsigned_bytes, tx_bytes)
     Ok((unsigned_bytes, tx_bytes))
 }
+
+/// Hex helper
+fn hex32(b: &[u8; 32]) -> String { hex::encode(b) }
+
+use anyhow::anyhow;
+use curve25519_dalek::RistrettoPoint;
+use xelis_common::crypto::elgamal::G;
+use xelis_common::crypto::proofs::H;
+use crate::types::TransferSketch;
+
+pub fn verify_commitments_on_skeleton(
+    skel: &TxSkeleton,
+    amounts: &[u64],
+    blinders_le: &[[u8; 32]],
+) -> Result<()> {
+    let n = skel.data_transfers.len();
+    if amounts.len() != n {
+        return Err(anyhow!("amounts len mismatch: got {}, need {}", amounts.len(), n));
+    }
+    if blinders_le.len() != n {
+        return Err(anyhow!("blinders len mismatch: got {}, need {}", blinders_le.len(), n));
+    }
+
+    println!("▶ Verifying {} output commitment(s)…", n);
+
+    for (i, t) in skel.data_transfers.iter().enumerate() {
+        let v = Scalar::from(amounts[i]);                         // u64 → Scalar (LE)
+        let r = Scalar::from_bytes_mod_order(blinders_le[i]);     // LE bytes → Scalar
+
+        let v = Scalar::from(amounts[i]);
+        let r = Scalar::from_bytes_mod_order(blinders_le[i]);
+
+        
+        // Device-style “splayed” math: vg = v*G, rh = r*H, C = vg + rh
+        // (dalek implements Scalar * RistrettoPoint)
+        let vg: RistrettoPoint = v * G;
+        let rh: RistrettoPoint = r * *H;
+
+        println!("      vg = {}",   hex::encode(vg.compress().as_bytes()));
+        println!("      rh   = {}", hex::encode(rh.compress().as_bytes()));
+
+        let c_point: RistrettoPoint = vg + rh;
+
+        let c_can = c_point.compress().to_bytes();
+
+        let want = t.commitment; // canonical 32B from your skeleton
+        let ok = c_can == want;
+
+        println!("  [{}] amount={}  blinder={}...", i, amounts[i], hex32(&blinders_le[i]));
+        println!("      C_calc = {}", hex::encode(c_can));
+        println!("      C_tx   = {}", hex::encode(want));
+
+        if !ok {
+            println!("✗ mismatch at output {}", i);
+            return Err(anyhow!("commitment mismatch at index {}", i));
+        } else {
+            println!("✓ output {} OK", i);
+        }
+    }
+
+    println!("✔ All commitments verified");
+    Ok(())
+}
+
+/// Convenience wrapper if you have the sketches alongside the skeleton.
+/// Uses `skel.output_blinders` and `sketches[i].amount` in the same order.
+pub fn verify_commitments_with_sketches(
+    skel: &TxSkeleton,
+    sketches: &[TransferSketch],
+) -> Result<()> {
+    let n = skel.data_transfers.len();
+    if sketches.len() != n {
+        return Err(anyhow!("sketches len mismatch: got {}, need {}", sketches.len(), n));
+    }
+    if skel.output_blinders.len() != n {
+        return Err(anyhow!("output_blinders len mismatch: got {}, need {}", skel.output_blinders.len(), n));
+    }
+    let amounts: Vec<u64> = sketches.iter().map(|s| s.amount).collect();
+    verify_commitments_on_skeleton(skel, &amounts, &skel.output_blinders)
+}

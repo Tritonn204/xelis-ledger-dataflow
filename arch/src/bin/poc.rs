@@ -1,6 +1,7 @@
 use debugger::{types::*, host_builder::build_tx_skeleton_host, ledger_checks::*, wallet_compare::compare_with_wallet_json};
 use debugger::proofs_host::{fill_ct_validity_proofs, build_ct_validity_proofs};
 use debugger::canonical::{canonical_roundtrip_bytes_with_ct, canonical_roundtrip_bytes_with_ct_verbose};
+use debugger::binary::{build_preview_memo, write_bundle};
 
 use std::fs;
 use std::path::Path;
@@ -54,7 +55,7 @@ fn main() {
     // Nothing here requires secrets; this is all host-side.
     // ─────────────────────────────────────────────────────────────────────────
     let transfers = vec![
-        TransferSketch { amount: 12_345, asset: [1u8; 32], destination_pub: KEY_P2_DST,  extra_data: None },
+        TransferSketch { amount: 12_345, asset: [0u8; 32], destination_pub: KEY_P2_DST,  extra_data: None },
         TransferSketch { amount: 67_890, asset: [3u8; 32], destination_pub: KEY_PFF_DST, extra_data: Some(vec![0xAA, 0xBB]) },
     ];
     let fee = 1100;
@@ -130,7 +131,7 @@ fn main() {
     // by serializing the real `Transaction` via xelis_common.
     // ─────────────────────────────────────────────────────────────────────────
     let digest = digest_for_signing_demo(&skel);
-    println!("Digest for signing (BLAKE3): {}", hex::encode(digest));
+    println!("Digest for signing (SHA512): {}", hex::encode(digest));
 
     // ─────────────────────────────────────────────────────────────────────────
     // [HOST] Canonical (Core) serialization round-trip with proof objects
@@ -145,25 +146,21 @@ fn main() {
     //
     // This proves the host can produce the exact blob the Ledger should sign.
     // ─────────────────────────────────────────────────────────────────────────
+    use debugger::canonical::verify_commitments_with_sketches;
     match canonical_roundtrip_bytes_with_ct_verbose(&skel, ct_objs) {
         Ok((unsigned_bytes, tx_bytes)) => {
-            // preferred preimage for the Ledger (if your firmware signs unsigned)
-            println!("Canonical pre-sig (UNSIGNED) bytes: {}", unsigned_bytes.len());
-            println!(
-                "Debug checksum UNSIGNED (BLAKE3): {}",
-                hex::encode(blake3::hash(&unsigned_bytes).as_bytes())
-            );
+            // Build minimal preview memo from the same transfers you constructed earlier
+            let memo = build_preview_memo(&skel, &transfers);
 
-            // full Transaction bytes (has placeholder signature field)
-            println!("Canonical TRANSACTION bytes: {}", tx_bytes.len());
-            println!(
-                "Debug checksum TX (BLAKE3): {}",
-                hex::encode(blake3::hash(&tx_bytes).as_bytes())
-            );
+            verify_commitments_with_sketches(&skel, &transfers);
 
-            // (optional) dump to files for your Python streamer
-            dump_bytes("out/poc_tx.unsigned.bin", &unsigned_bytes);
-            dump_bytes("out/poc_tx.transaction.bin", &tx_bytes);
+            // Write XLB1 bundles (memo + canonical bytes)
+            write_bundle("out/poc_tx.unsigned.bundle", &memo, &unsigned_bytes, &skel.output_blinders);
+            write_bundle("out/poc_tx.transaction.bundle", &memo, &tx_bytes, &skel.output_blinders);
+
+            // (Optional) keep raw .bin files too if you still want them
+            // dump_bytes("out/poc_tx.unsigned.bin", &unsigned_bytes);
+            // dump_bytes("out/poc_tx.transaction.bin", &tx_bytes);
         }
         Err(e) => eprintln!("Canonical round-trip (verbose): {e:#}"),
     }
