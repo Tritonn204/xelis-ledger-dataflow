@@ -61,91 +61,102 @@ fn build_asset_table(transfers: &[TransferSketch]) -> (Vec<[u8; 32]>, impl Fn(&[
 /// Build a minimal, untrusted preview memo for device UI with asset table optimization.
 /// Device will later re-parse the canonical TX stream and reject on any mismatch.
 /// TLVs included:
-///   0x01 TX_TYPE (u8)
-///   0x02 FEE     (u64 LE)
-///   0x03 NONCE   (u64 LE)
-///   0x04 ASSET_TABLE: count(varint) | asset1(32) | asset2(32) | ...
-///   0x10 OUT_COUNT (varint-as-payload; no value bytes)
-///   0x20 OUT_ITEM repeated:
+pub const TAG_TX_TYPE: u8 = 0x01;
+pub const TAG_FEE: u8 = 0x02;
+pub const TAG_NONCE: u8 = 0x03;
+pub const TAG_ASSET_TABLE: u8 = 0x04;  // New: asset table
+pub const TAG_OUT_COUNT: u8 = 0x10;
+pub const TAG_OUT_ITEM: u8 = 0x20;
+pub const TAG_BURN: u8 = 0x30;
 ///        asset_index(1) | dest_pk(32) | amount(u64 LE) | extra_len(varint) | preview_len(varint) | preview_bytes
-pub fn build_preview_memo(
-    skel: &TxSkeleton,
-    transfers: &[TransferSketch],
-) -> Vec<u8> {
-    // For this POC we only emit Transfers (type = 1)
-    let tx_type = 1u8;
+pub fn build_preview_memo(skel: &TxSkeleton, payload: &TxGeneratorPayload) -> Vec<u8> {
     let mut memo = Vec::new();
 
-    // Build asset table
-    let (asset_table, get_asset_index) = build_asset_table(transfers);
-    
-    // Write standard fields
-    tlv_u8(0x01, tx_type, &mut memo);
-    tlv_u64(0x02, skel.fee, &mut memo);
-    tlv_u64(0x03, skel.nonce, &mut memo);
+    // Common header
+    match payload {
+        TxGeneratorPayload::Transfers(_) => tlv_u8(TAG_TX_TYPE, 1, &mut memo), // TX_TRANSFER
+        TxGeneratorPayload::Burn { .. }  => tlv_u8(TAG_TX_TYPE, 0, &mut memo), // TX_BURN
+    }
+    tlv_u64(TAG_FEE,   skel.fee,   &mut memo);
+    tlv_u64(TAG_NONCE, skel.nonce, &mut memo);
 
-    // Write asset table if we have non-native assets
-    if !asset_table.is_empty() {
-        memo.push(0x04); // TAG_ASSET_TABLE
-        
-        // Calculate table size
-        let mut table_data = Vec::new();
-        leb128_write(asset_table.len() as u64, &mut table_data);
-        for asset in &asset_table {
-            table_data.extend_from_slice(asset);
+    match payload {
+        // ───────────────────────── Transfers ─────────────────────────
+        TxGeneratorPayload::Transfers(transfers) => {
+            // Asset table
+            let (asset_table, idx_of) = build_asset_table(transfers);
+            if !asset_table.is_empty() {
+                let mut table = Vec::new();
+                leb128_write(asset_table.len() as u64, &mut table);
+                for a in &asset_table { table.extend_from_slice(a); }
+                memo.push(TAG_ASSET_TABLE);
+                leb128_write(table.len() as u64, &mut memo);
+                memo.extend_from_slice(&table);
+            }
+
+            // OUT_COUNT (special case: tag + varint only)
+            let out_count = skel.data_transfers.len() as u64;
+            memo.push(TAG_OUT_COUNT);
+            leb128_write(out_count, &mut memo);
+
+            // OUT_ITEMs with preview
+            // NOTE: we assume `skel.data_transfers.len() == transfers.len()`
+            for (i, t) in skel.data_transfers.iter().enumerate() {
+                let asset_idx = idx_of(&t.asset);
+                let dest = t.destination;
+                let amount = transfers[i].amount;
+
+                let extra = transfers[i].extra_data.as_ref().map(|v| v.as_slice()).unwrap_or(&[]);
+                let extra_len = extra.len() as u64;
+                let pv_len = core::cmp::min(extra.len(), MEMO_PREVIEW_MAX) as u64;
+
+                // value
+                let mut val = Vec::with_capacity(1 + 32 + 8 + 10 + 10 + pv_len as usize);
+                val.push(asset_idx);
+                val.extend_from_slice(&dest);
+                val.extend_from_slice(&amount.to_le_bytes());
+                leb128_write(extra_len, &mut val);
+                leb128_write(pv_len, &mut val);
+                val.extend_from_slice(&extra[..(pv_len as usize)]);
+
+                memo.push(TAG_OUT_ITEM);
+                leb128_write(val.len() as u64, &mut memo);
+                memo.extend_from_slice(&val);
+            }
         }
-        
-        // Write table TLV
-        leb128_write(table_data.len() as u64, &mut memo);
-        memo.extend_from_slice(&table_data);
-        
-        println!("Asset table: {} unique non-native assets", asset_table.len());
+
+        // ─────────────────────────── Burn ───────────────────────────
+        TxGeneratorPayload::Burn { amount, asset } => {
+            // Optional asset table for non-native
+            let asset_idx = if *asset == NATIVE_ASSET {
+                NATIVE_ASSET_INDEX
+            } else {
+                let mut table = Vec::new();
+                leb128_write(1, &mut table);
+                table.extend_from_slice(asset);
+                memo.push(TAG_ASSET_TABLE);
+                leb128_write(table.len() as u64, &mut memo);
+                memo.extend_from_slice(&table);
+                1u8
+            };
+
+            // TAG_BURN value: asset_idx(1) | amount(8) | preview_len(varint=0)
+            let mut val = Vec::with_capacity(1 + 8 + 1);
+            val.push(asset_idx);
+            val.extend_from_slice(&amount.to_le_bytes());
+            leb128_write(0, &mut val); // burns can't have extra → no preview
+
+            memo.push(TAG_BURN);
+            leb128_write(val.len() as u64, &mut memo);
+            memo.extend_from_slice(&val);
+        }
     }
 
-    // Write output count
-    let out_count = skel.data_transfers.len() as u64;
-    memo.push(0x10);
-    leb128_write(out_count, &mut memo); // OUT_COUNT payload = varint itself
-
-    // Write outputs with asset indices
-    for (i, t) in skel.data_transfers.iter().enumerate() {
-        let asset_index = get_asset_index(&t.asset);
-        let dest = t.destination;
-        let amount = transfers[i].amount;
-
-        let extra = transfers[i]
-            .extra_data
-            .as_ref()
-            .map(|v| v.as_slice())
-            .unwrap_or(&[]);
-        let extra_full_len = extra.len() as u64;
-        let preview_len = core::cmp::min(extra.len(), MEMO_PREVIEW_MAX);
-        let extra_preview = &extra[..preview_len];
-
-        // Compose OUT_ITEM value (now with asset_index instead of full asset)
-        // layout: asset_index(1) + dest(32) + amount(8) + extra_len(varint) + preview_len(varint) + preview_bytes
-        let mut val = Vec::with_capacity(1 + 32 + 8 + 10 + 10 + preview_len);
-        val.push(asset_index);  // Just 1 byte instead of 32!
-        val.extend_from_slice(&dest);
-        val.extend_from_slice(&amount.to_le_bytes());
-        leb128_write(extra_full_len, &mut val);
-        leb128_write(preview_len as u64, &mut val);
-        val.extend_from_slice(extra_preview);
-
-        // OUT_ITEM TLV
-        memo.push(0x20);
-        leb128_write(val.len() as u64, &mut memo);
-        memo.extend_from_slice(&val);
-    }
-
-    // Log space savings
-    let old_size = out_count as usize * 32; // Old: 32 bytes per asset
-    let new_size = asset_table.len() * 32 + out_count as usize; // New: table + 1 byte per output
-    println!("Memo asset data: {} → {} bytes (saved {} bytes)", 
-        old_size, new_size, old_size.saturating_sub(new_size));
+    // println!("MEMO after build: {}", hex::encode(&memo));
 
     memo
 }
+
 
 pub fn write_bundle(
     path: &str, 
@@ -164,6 +175,8 @@ pub fn write_bundle(
     leb128_write(memo.len() as u64, &mut out);
     out.extend_from_slice(memo);
     
+    // println!("OUT after memo write: {}", hex::encode(&out));
+
     // Blinders section
     let blinders_data: Vec<u8> = blinders.iter().flat_map(|b| b.iter()).copied().collect();
     leb128_write(blinders_data.len() as u64, &mut out);
@@ -175,6 +188,7 @@ pub fn write_bundle(
     if let Some(p) = Path::new(path).parent() {
         let _ = fs::create_dir_all(p);
     }
+
     fs::write(path, &out).expect("write bundle");
     println!("wrote {} (v1 with blinders)", path);
 }

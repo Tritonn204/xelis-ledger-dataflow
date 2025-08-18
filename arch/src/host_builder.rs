@@ -13,20 +13,43 @@ fn dummy_ct_proof() -> CtValidityProof {
     CtValidityProof { Y_0: [0;32], Y_1: [0;32], z_r: [0;32], z_x: [0;32] }
 }
 
+fn minimal_zero_range_proof_bytes() -> Vec<u8> {
+    let pc = PedersenGens::default();
+    let bp = BulletproofGens::new(64, 1);
+    let mut t = Transcript::new(b"XELIS_RangeProof_v1");
+    let mut rng = OsRng;
+    let v = [0u64];
+    let r = [Scalar::random(&mut rng)];
+    let (rp, _coms) = RangeProof::prove_multiple(&bp, &pc, &mut t, &v, &r, 64).unwrap();
+    rp.to_bytes()
+}
+
 /// Build commitments + Bulletproof(s); returns a `TxSkeleton` (no signature).
-pub fn build_tx_skeleton_host(
-    transfers: &[TransferSketch],
+pub fn build_skeleton_host(
+    payload: TxGeneratorPayload,
     fee: u64,
     nonce: u64,
     source_pubkey: [u8; 32],
     reference: Reference,
 ) -> TxSkeleton {
-    // Special case for burns - no range proofs needed
-    if transfers.len() == 1 && transfers[0].extra_data.is_none() {
-        // Might be a burn, return minimal skeleton
-        // You'll need to add burn detection logic here
+    match payload.clone() {
+        TxGeneratorPayload::Transfers(transfers) => {
+            build_transfer_skeleton(transfers, fee, nonce, source_pubkey, reference, payload)
+        }
+        TxGeneratorPayload::Burn { amount, asset } => {
+            build_burn_skeleton(amount, asset, fee, nonce, source_pubkey, reference, payload)
+        }
     }
-    
+}
+
+fn build_transfer_skeleton(
+    transfers: Vec<TransferSketch>,
+    fee: u64,
+    nonce: u64,
+    source_pubkey: [u8; 32],
+    reference: Reference,
+    tx_type: TxGeneratorPayload,
+) -> TxSkeleton {
     let pc_gens = PedersenGens::default();
     
     // Calculate padded size for Bulletproof generation
@@ -53,12 +76,12 @@ pub fn build_tx_skeleton_host(
         commits.push(TransferCommit {
             asset: t.asset,
             commitment: c_bytes,
-            ct_validity_proof: dummy_ct_proof(),
             destination: t.destination_pub,
             extra_data: t.extra_data.clone(),
-            receiver_handle: [0u8; 32],
             sender_handle: [0u8; 32],
-            ct_validity_proof_bytes: Vec::new(),
+            receiver_handle: [0u8; 32],
+            ct_validity_proof: dummy_ct_proof(),
+            ct_validity_proof_bytes: Vec::new(), // Will be filled later
         });
         rp_values.push(t.amount);
         rp_blinders.push(*b);
@@ -97,5 +120,50 @@ pub fn build_tx_skeleton_host(
         source: source_pubkey,
         reference,
         output_blinders: blinders.iter().map(|s| s.to_bytes()).collect(), // Only real blinders
+        tx_type,
     }
+}
+
+fn build_burn_skeleton(
+    amount: u64,
+    asset: [u8; 32],
+    fee: u64,
+    nonce: u64,
+    source_pubkey: [u8; 32],
+    reference: Reference,
+    tx_type: TxGeneratorPayload,
+) -> TxSkeleton {
+    // For burns:
+    // - No output transfers (nothing goes to any destination)
+    // - No range proof in outputs (it's in source commitments)
+    // - No CT validity proofs (no receiver to hide from)
+
+    TxSkeleton {
+        data_transfers: vec![], // Burns have no outputs
+        range_proof: minimal_zero_range_proof_bytes(),    // Range proof is in source commitments for burns
+        source_commitments: vec![],
+        fee,
+        nonce,
+        source: source_pubkey,
+        reference,
+        output_blinders: vec![], // No output blinders for burns
+        tx_type,
+    }
+}
+
+// Keep the original function as a wrapper for backward compatibility
+pub fn build_tx_skeleton_host(
+    transfers: &[TransferSketch],
+    fee: u64,
+    nonce: u64,
+    source_pubkey: [u8; 32],
+    reference: Reference,
+) -> TxSkeleton {
+    build_skeleton_host(
+        TxGeneratorPayload::Transfers(transfers.to_vec()),
+        fee,
+        nonce,
+        source_pubkey,
+        reference,
+    )
 }

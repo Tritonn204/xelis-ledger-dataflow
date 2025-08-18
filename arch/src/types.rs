@@ -1,5 +1,11 @@
 use serde::{Serialize, Deserialize};
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum TxGeneratorPayload {
+    Transfers(Vec<TransferSketch>),
+    Burn { amount: u64, asset: [u8; 32] },
+}
+
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct TransferSketch {
     pub amount: u64,
@@ -61,4 +67,5 @@ pub struct TxSkeleton {
 
     // Not on-chain; only used by “Ledger” checks
     pub output_blinders: Vec<[u8; 32]>,   // Scalar bytes per transfer
+    pub tx_type: TxGeneratorPayload,
 }

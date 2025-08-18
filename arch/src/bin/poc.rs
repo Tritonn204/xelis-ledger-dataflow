@@ -1,6 +1,6 @@
-use debugger::{types::*, host_builder::build_tx_skeleton_host, ledger_checks::*, wallet_compare::compare_with_wallet_json};
+use debugger::{types::*, host_builder::build_skeleton_host, ledger_checks::*, wallet_compare::compare_with_wallet_json};
 use debugger::proofs_host::{fill_ct_validity_proofs, build_ct_validity_proofs};
-use debugger::canonical::{canonical_roundtrip_bytes_with_ct, canonical_roundtrip_bytes_with_ct_verbose};
+use debugger::canonical::{canonical_roundtrip_bytes_with_ct_verbose, verify_commitments_with_sketches};
 use debugger::binary::{build_preview_memo, write_bundle};
 
 use std::fs;
@@ -10,6 +10,8 @@ use rand::{thread_rng, Rng};
 use curve25519_dalek::scalar::Scalar;
 use curve25519_dalek::ristretto::{RistrettoPoint, CompressedRistretto};
 use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
+
+use xelis_common::crypto::proofs::CiphertextValidityProof;
 
 /// Write bytes to a file (create parent dirs if needed)
 fn dump_bytes(path: &str, bytes: &[u8]) {
@@ -75,14 +77,13 @@ fn main() {
     println!("  Private: {} (not used in host)", hex::encode(&source_private));
     println!();
 
-    // Choose transaction type
+    // Choose transaction type and build payload
     println!("Select transaction type:");
     println!("  1) Transfer");
     println!("  2) Burn");
-    let tx_type = prompt_number("Enter choice (1-2): ", 1, 2);
+    let tx_choice = prompt_number("Enter choice (1-2): ", 1, 2);
     
-    // Generate transfers/burns based on type
-    let transfers = match tx_type {
+    let tx_payload = match tx_choice {
         1 => {
             // Transfer flow
             let output_count = prompt_number("How many outputs? (1-256): ", 1, 256) as usize;
@@ -92,20 +93,15 @@ fn main() {
             for i in 0..output_count {
                 let mut rng = thread_rng();
                 
-                // Random amount between 100 and 1_000_000
                 let amount = rng.gen_range(100..=1_000_000);
-                
-                // Random asset or native (0x00...)
                 let asset = if rng.gen_bool(0.7) {
-                    [0u8; 32] // 70% chance of native asset
+                    [0u8; 32]
                 } else {
                     generate_random_asset()
                 };
                 
-                // Random destination
                 let (_, dest_pub) = generate_random_keypair();
                 
-                // Optional extra data (20% chance)
                 let extra_data = if rng.gen_bool(0.2) {
                     let len = rng.gen_range(1..=256);
                     let mut data = vec![0u8; len];
@@ -123,47 +119,28 @@ fn main() {
                 });
                 
                 println!("  [{}] {} units of asset {}... to {}...", 
-                    i,
-                    amount,
-                    hex::encode(&asset[..8]),
-                    hex::encode(&dest_pub[..8])
-                );
+                    i, amount, hex::encode(&asset[..8]), hex::encode(&dest_pub[..8]));
                 if extra_data.is_some() {
                     println!("       (with {} bytes extra data)", extra_data.unwrap().len());
                 }
             }
-            transfers
+            TxGeneratorPayload::Transfers(transfers)
         }
         2 => {
             // Burn flow
             println!("\nGenerating burn transaction...");
             let mut rng = thread_rng();
             
-            // Random amount to burn
             let amount = rng.gen_range(1000..=10_000_000);
-            
-            // Random asset
             let asset = if rng.gen_bool(0.5) {
-                [0u8; 32] // 50% chance of native asset
+                [0u8; 32]
             } else {
                 generate_random_asset()
             };
             
-            // For burns, we still need a "destination" in the TransferSketch
-            // but it won't be used in the actual burn transaction
-            let (_, dummy_dest) = generate_random_keypair();
+            println!("  Burning {} units of asset {}...", amount, hex::encode(&asset[..8]));
             
-            println!("  Burning {} units of asset {}...", 
-                amount,
-                hex::encode(&asset[..8])
-            );
-            
-            vec![TransferSketch {
-                amount,
-                asset,
-                destination_pub: dummy_dest,
-                extra_data: None,
-            }]
+            TxGeneratorPayload::Burn { amount, asset }
         }
         _ => unreachable!(),
     };
@@ -187,74 +164,117 @@ fn main() {
     println!("  Reference: {}... @ height {}", hex::encode(&reference.hash[..8]), reference.topoheight);
 
     // ─────────────────────────────────────────────────────────────────────────
-    // [HOST] Build a TxSkeleton (commitments + BP transcript input)
+    // [HOST] Build a TxSkeleton using the new unified builder
     // ─────────────────────────────────────────────────────────────────────────
-    let mut skel = build_tx_skeleton_host(&transfers, fee, nonce, source_pubkey, reference);
+    let mut skel = build_skeleton_host(tx_payload.clone(), fee, nonce, source_pubkey, reference);
 
     println!("\nBuilt TxSkeleton:");
-    println!("  outputs: {}", skel.data_transfers.len());
+    match &skel.tx_type.clone() {
+        TxGeneratorPayload::Transfers(transfers) => {
+            println!("  Type: Transfer");
+            println!("  outputs: {}", transfers.len());
+        }
+        TxGeneratorPayload::Burn { amount, asset } => {
+            println!("  Type: Burn");
+            println!("  amount: {}", amount);
+            println!("  asset: {}", hex::encode(&asset[..8]));
+        }
+    }
     println!("  range_proof bytes: {}", skel.range_proof.len());
     println!("  fee: {}, nonce: {}", skel.fee, skel.nonce);
 
     // ─────────────────────────────────────────────────────────────────────────
-    // [LEDGER (verifier-style) CHECKS, but performed here on HOST]
+    // [LEDGER (verifier-style) CHECKS and processing based on transaction type]
     // ─────────────────────────────────────────────────────────────────────────
-    let amounts: Vec<u64> = transfers.iter().map(|t| t.amount).collect();
-    let commitments: Vec<[u8; 32]> = skel.data_transfers.iter().map(|t| t.commitment).collect();
+    match &skel.tx_type.clone() {
+        TxGeneratorPayload::Transfers(transfers) => {
+            let amounts: Vec<u64> = transfers.iter().map(|t| t.amount).collect();
+            let commitments: Vec<[u8; 32]> = skel.data_transfers.iter().map(|t| t.commitment).collect();
 
-    let ok = verify_outputs_match_commitments(&skel, &amounts);
-    println!("[DEVICE-STYLE] commitment check (host-sim): {}", ok);
+            let ok = verify_outputs_match_commitments(&skel, &amounts);
+            println!("[DEVICE-STYLE] commitment check (host-sim): {}", ok);
 
-    let rp_ok = verify_range_proof_bytes(&skel.range_proof, &commitments);
-    println!("[HOST-DEV] range proof verifies: {}", rp_ok);
+            let rp_ok = verify_range_proof_bytes(&skel.range_proof, &commitments);
+            println!("[HOST-DEV] range proof verifies: {}", rp_ok);
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // [HOST] Build per-output Ciphertext-Validity proofs (CT proofs)
-    // ─────────────────────────────────────────────────────────────────────────
-    let ct_objs = match build_ct_validity_proofs(&skel, &amounts) {
-        Ok(v) => v,
-        Err(e) => { eprintln!("CT proof build failed: {e}"); return; }
-    };
+            // Build CT proofs for transfers
+            let ct_objs = match build_ct_validity_proofs(&skel, &amounts) {
+                Ok(v) => v,
+                Err(e) => { eprintln!("CT proof build failed: {e}"); return; }
+            };
 
-    if let Err(e) = fill_ct_validity_proofs(&mut skel, &amounts) {
-        eprintln!("CT proof fill failed: {e}");
+            if let Err(e) = fill_ct_validity_proofs(&mut skel, &amounts) {
+                eprintln!("CT proof fill failed: {e}");
+            }
+
+            // Generate digest
+            let digest = digest_for_signing_demo(&skel);
+            println!("Digest for signing (SHA512): {}", hex::encode(digest));
+
+            // Verify commitments
+            use debugger::canonical::verify_commitments_with_sketches;
+            if let Err(e) = verify_commitments_with_sketches(&skel, &transfers) {
+                eprintln!("Commitment verification failed: {e}");
+                return;
+            }
+
+            // Process transfer transaction
+            process_transfer_transaction(skel, &transfers, ct_objs);
+        }
+        TxGeneratorPayload::Burn { amount, asset } => {
+            // Burns don't need output commitment checks or CT proofs
+            println!("[BURN] No output commitments to verify");
+            println!("[BURN] No CT proofs needed (no receivers)");
+
+            // Generate digest
+            let digest = digest_for_signing_demo(&skel);
+            println!("Digest for signing (SHA512): {}", hex::encode(digest));
+
+            // Process burn transaction
+            process_burn_transaction(skel, *amount, *asset);
+        }
     }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // [HOST] Generate digest
-    // ─────────────────────────────────────────────────────────────────────────
-    let digest = digest_for_signing_demo(&skel);
-    println!("Digest for signing (SHA512): {}", hex::encode(digest));
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // [HOST] Canonical serialization and output
-    // ─────────────────────────────────────────────────────────────────────────
-    use debugger::canonical::verify_commitments_with_sketches;
+}
+use xelis_common::serializer::Serializer;
+fn process_transfer_transaction(
+    skel: TxSkeleton, 
+    transfers: &[TransferSketch], 
+    ct_objs: Vec<CiphertextValidityProof>
+) {
     match canonical_roundtrip_bytes_with_ct_verbose(&skel, ct_objs) {
         Ok((unsigned_bytes, tx_bytes)) => {
-            // Build preview memo
-            let memo = build_preview_memo(&skel, &transfers);
-
-            verify_commitments_with_sketches(&skel, &transfers);
-
-            // Determine output filename based on tx type
-            let tx_type_str = match tx_type {
-                1 => "transfer",
-                2 => "burn",
-                _ => "unknown",
-            };
-            
-            let unsigned_bundle = format!("out/poc_{}.unsigned.bundle", tx_type_str);
-            let tx_bundle = format!("out/poc_{}.transaction.bundle", tx_type_str);
-            
+            // Build preview memo for transfers
+            let memo = build_preview_memo(
+                &skel,
+                &TxGeneratorPayload::Transfers(transfers.to_vec()),
+            );
             // Write XLB1 bundles
-            write_bundle(&unsigned_bundle, &memo, &unsigned_bytes, &skel.output_blinders);
-            write_bundle(&tx_bundle, &memo, &tx_bytes, &skel.output_blinders);
+            write_bundle("out/poc_transfer.unsigned.bundle", &memo, &unsigned_bytes, &skel.output_blinders);
+            write_bundle("out/poc_transfer.transaction.bundle", &memo, &tx_bytes, &skel.output_blinders);
             
-            println!("\n✅ Successfully generated {} transaction!", tx_type_str);
-            println!("   Unsigned bundle: {}", unsigned_bundle);
-            println!("   Transaction bundle: {}", tx_bundle);
+            println!("\n✅ Successfully generated transfer transaction!");
+            println!("   Unsigned bundle: out/poc_transfer.unsigned.bundle");
+            println!("   Transaction bundle: out/poc_transfer.transaction.bundle");
         }
-        Err(e) => eprintln!("Canonical round-trip (verbose): {e:#}"),
+        Err(e) => eprintln!("Transfer canonical round-trip: {e:#}"),
+    }
+}
+
+fn process_burn_transaction(skel: TxSkeleton, amount: u64, asset: [u8; 32]) {
+    // For burns, we pass empty CT proofs since they're not needed
+    match canonical_roundtrip_bytes_with_ct_verbose(&skel, vec![]) {
+        Ok((unsigned_bytes, tx_bytes)) => {
+            // Build memo for burn transaction
+            let memo = build_preview_memo(&skel, &TxGeneratorPayload::Burn { amount, asset });
+            
+            // No output blinders for burns since there are no outputs
+            write_bundle("out/poc_burn.unsigned.bundle", &memo, &unsigned_bytes, &[]);
+            write_bundle("out/poc_burn.transaction.bundle", &memo, &tx_bytes, &[]);
+            
+            println!("\n✅ Successfully generated burn transaction!");
+            println!("   Unsigned bundle: out/poc_burn.unsigned.bundle");
+            println!("   Transaction bundle: out/poc_burn.transaction.bundle");
+        }
+        Err(e) => eprintln!("Burn canonical round-trip: {e:#}"),
     }
 }
