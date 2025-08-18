@@ -5,6 +5,11 @@ use debugger::binary::{build_preview_memo, write_bundle};
 
 use std::fs;
 use std::path::Path;
+use std::io::{self, Write};
+use rand::{thread_rng, Rng};
+use curve25519_dalek::scalar::Scalar;
+use curve25519_dalek::ristretto::{RistrettoPoint, CompressedRistretto};
+use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
 
 /// Write bytes to a file (create parent dirs if needed)
 fn dump_bytes(path: &str, bytes: &[u8]) {
@@ -13,159 +18,243 @@ fn dump_bytes(path: &str, bytes: &[u8]) {
     println!("wrote {}", path);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Demo key material (valid compressed Ristretto pubkeys).
-// In a real wallet:
-//
-//  • SOURCE pubkey comes from the user’s account (view/spend key derivations).
-//    - The *private* spend key never leaves the Ledger; only its *public*
-//      key (compressed) is used on the host when non-secret ops need it.
-//
-//  • DESTINATION pubkeys come from recipients (addresses → decode → dest PK).
-// ─────────────────────────────────────────────────────────────────────────────
-const KEY_P1_SRC: [u8; 32] = [
-    140, 146,  64, 180,  86, 169, 230, 220,
-    101, 195, 119, 161,   4, 141, 116,  95,
-    148, 160, 140, 219, 127,  68, 203, 205,
-    123,  70, 243,  64,  72, 135,  17,  52,
-];
+/// Generate a random valid Ristretto keypair
+fn generate_random_keypair() -> ([u8; 32], [u8; 32]) {
+    let mut rng = thread_rng();
+    let mut scalar_bytes = [0u8; 32];
+    rng.fill(&mut scalar_bytes);
+    
+    // Create scalar from random bytes
+    let private_key = Scalar::from_bytes_mod_order(scalar_bytes);
+    
+    // Derive public key: P = s*G
+    let public_point: RistrettoPoint = private_key * RISTRETTO_BASEPOINT_POINT;
+    let public_key = public_point.compress();
+    
+    (scalar_bytes, public_key.to_bytes())
+}
 
-const KEY_P2_DST: [u8; 32] = [
-    240,  91, 193, 223,  40,  49, 113, 124,
-     41, 146, 216,  91,  87, 224, 207,  61,
-     18,  63, 214, 194,  84,  37, 125, 229,
-    247, 132, 190,  54, 151,  71, 178,  73,
-];
+/// Generate a random asset ID (just random 32 bytes)
+fn generate_random_asset() -> [u8; 32] {
+    let mut rng = thread_rng();
+    let mut asset = [0u8; 32];
+    rng.fill(&mut asset);
+    asset
+}
 
-const KEY_PFF_DST: [u8; 32] = [
-    246, 222, 207, 191, 158, 250, 188, 138,
-    165, 148,  82, 170,  87,  12, 184,  78,
-    237, 127, 207, 202, 125, 174, 165, 138,
-    147, 185,  52,  68,  64,  10, 122, 115,
-];
+/// Get user input with a prompt
+fn prompt(msg: &str) -> String {
+    print!("{}", msg);
+    io::stdout().flush().unwrap();
+    let mut input = String::new();
+    io::stdin().read_line(&mut input).unwrap();
+    input.trim().to_string()
+}
+
+/// Get a number from user with validation
+fn prompt_number(msg: &str, min: u64, max: u64) -> u64 {
+    loop {
+        let input = prompt(msg);
+        match input.parse::<u64>() {
+            Ok(n) if n >= min && n <= max => return n,
+            _ => println!("Please enter a number between {} and {}", min, max),
+        }
+    }
+}
 
 fn main() {
-    // ─────────────────────────────────────────────────────────────────────────
-    // [HOST] Draft “what the user wants to send”
-    //
-    // In a real wallet UI this comes from screens/forms:
-    //   - A set of (amount, asset, destination, optional memo)
-    //   - Fee strategy & explicit nonce/reference (or fetched from daemon)
-    //
-    // Nothing here requires secrets; this is all host-side.
-    // ─────────────────────────────────────────────────────────────────────────
-    let transfers = vec![
-        TransferSketch { amount: 12_345, asset: [0u8; 32], destination_pub: KEY_P2_DST,  extra_data: None },
-        TransferSketch { amount: 67_890, asset: [3u8; 32], destination_pub: KEY_PFF_DST, extra_data: Some(vec![0xAA, 0xBB]) },
-    ];
-    let fee = 1100;
-    let nonce = 42;
-    let source_pubkey = KEY_P1_SRC;                            // (public only; no secrets here)
-    let reference = Reference { hash: [7u8; 32], topoheight: 123_456 };
+    println!("═══════════════════════════════════════════════════════════════");
+    println!("    Xelis Transaction Generator Wizard");
+    println!("═══════════════════════════════════════════════════════════════");
+    println!();
+
+    // Generate source keypair
+    let (source_private, source_pubkey) = generate_random_keypair();
+    println!("Generated source keypair:");
+    println!("  Public:  {}", hex::encode(&source_pubkey));
+    println!("  Private: {} (not used in host)", hex::encode(&source_private));
+    println!();
+
+    // Choose transaction type
+    println!("Select transaction type:");
+    println!("  1) Transfer");
+    println!("  2) Burn");
+    let tx_type = prompt_number("Enter choice (1-2): ", 1, 2);
+    
+    // Generate transfers/burns based on type
+    let transfers = match tx_type {
+        1 => {
+            // Transfer flow
+            let output_count = prompt_number("How many outputs? (1-256): ", 1, 256) as usize;
+            let mut transfers = Vec::new();
+            
+            println!("\nGenerating {} random transfers...", output_count);
+            for i in 0..output_count {
+                let mut rng = thread_rng();
+                
+                // Random amount between 100 and 1_000_000
+                let amount = rng.gen_range(100..=1_000_000);
+                
+                // Random asset or native (0x00...)
+                let asset = if rng.gen_bool(0.7) {
+                    [0u8; 32] // 70% chance of native asset
+                } else {
+                    generate_random_asset()
+                };
+                
+                // Random destination
+                let (_, dest_pub) = generate_random_keypair();
+                
+                // Optional extra data (20% chance)
+                let extra_data = if rng.gen_bool(0.2) {
+                    let len = rng.gen_range(1..=256);
+                    let mut data = vec![0u8; len];
+                    rng.fill(&mut data[..]);
+                    Some(data)
+                } else {
+                    None
+                };
+                
+                transfers.push(TransferSketch {
+                    amount,
+                    asset,
+                    destination_pub: dest_pub,
+                    extra_data: extra_data.clone(),
+                });
+                
+                println!("  [{}] {} units of asset {}... to {}...", 
+                    i,
+                    amount,
+                    hex::encode(&asset[..8]),
+                    hex::encode(&dest_pub[..8])
+                );
+                if extra_data.is_some() {
+                    println!("       (with {} bytes extra data)", extra_data.unwrap().len());
+                }
+            }
+            transfers
+        }
+        2 => {
+            // Burn flow
+            println!("\nGenerating burn transaction...");
+            let mut rng = thread_rng();
+            
+            // Random amount to burn
+            let amount = rng.gen_range(1000..=10_000_000);
+            
+            // Random asset
+            let asset = if rng.gen_bool(0.5) {
+                [0u8; 32] // 50% chance of native asset
+            } else {
+                generate_random_asset()
+            };
+            
+            // For burns, we still need a "destination" in the TransferSketch
+            // but it won't be used in the actual burn transaction
+            let (_, dummy_dest) = generate_random_keypair();
+            
+            println!("  Burning {} units of asset {}...", 
+                amount,
+                hex::encode(&asset[..8])
+            );
+            
+            vec![TransferSketch {
+                amount,
+                asset,
+                destination_pub: dummy_dest,
+                extra_data: None,
+            }]
+        }
+        _ => unreachable!(),
+    };
+
+    // Random fee and nonce
+    let mut rng = thread_rng();
+    let fee = rng.gen_range(100..=10_000);
+    let nonce = rng.gen_range(1..=1_000_000);
+    
+    // Random reference
+    let mut ref_hash = [0u8; 32];
+    rng.fill(&mut ref_hash);
+    let reference = Reference { 
+        hash: ref_hash, 
+        topoheight: rng.gen_range(1..=1_000_000) 
+    };
+
+    println!("\nTransaction parameters:");
+    println!("  Fee: {}", fee);
+    println!("  Nonce: {}", nonce);
+    println!("  Reference: {}... @ height {}", hex::encode(&reference.hash[..8]), reference.topoheight);
 
     // ─────────────────────────────────────────────────────────────────────────
     // [HOST] Build a TxSkeleton (commitments + BP transcript input)
-    //
-    // This function:
-    //   • Mints per-output Pedersen commitments: C_i = v_i*G + r_i*H
-    //   • (In our POC) stores the blinders r_i for proof building
-    //   • Constructs and serializes a Bulletproof range proof over {v_i}
-    //   • Copies through fee/nonce/reference/source
-    //
-    // This is heavy compute/memory → stays on HOST, not Ledger.
     // ─────────────────────────────────────────────────────────────────────────
     let mut skel = build_tx_skeleton_host(&transfers, fee, nonce, source_pubkey, reference);
 
-    println!("Built TxSkeleton:");
+    println!("\nBuilt TxSkeleton:");
     println!("  outputs: {}", skel.data_transfers.len());
     println!("  range_proof bytes: {}", skel.range_proof.len());
     println!("  fee: {}, nonce: {}", skel.fee, skel.nonce);
 
     // ─────────────────────────────────────────────────────────────────────────
     // [LEDGER (verifier-style) CHECKS, but performed here on HOST]
-    //
-    // The Ledger *doesn’t* recompute proofs; it only verifies the host feed:
-    //   • Recompute commitments from (amounts, recorded blinders) and
-    //     check they match bytes we plan to put on-chain.
-    //   • Verify Bulletproof bytes against the output commitments.
-    //
-    // In the real app you’ll either:
-    //   (A) do these checks on HOST for dev confidence, or
-    //   (B) expose a lightweight APDU to let the Ledger recompute just enough
-    //       to “attest” to what it’s about to sign (optional).
     // ─────────────────────────────────────────────────────────────────────────
     let amounts: Vec<u64> = transfers.iter().map(|t| t.amount).collect();
     let commitments: Vec<[u8; 32]> = skel.data_transfers.iter().map(|t| t.commitment).collect();
 
-    // This mirrors the *on-device* attestation you’ll do before signing:
     let ok = verify_outputs_match_commitments(&skel, &amounts);
     println!("[DEVICE-STYLE] commitment check (host-sim): {}", ok);
 
-    // This is a host-only dev sanity check; do not implement on device:
     let rp_ok = verify_range_proof_bytes(&skel.range_proof, &commitments);
     println!("[HOST-DEV] range proof verifies: {}", rp_ok);
 
     // ─────────────────────────────────────────────────────────────────────────
     // [HOST] Build per-output Ciphertext-Validity proofs (CT proofs)
-    //
-    // For TxVersion >= V1 Xelis expects Y₂ (i.e., the proof *must* bind the
-    // source pubkey). Critically, this still does not require the spend key —
-    // the construction uses public keys, amounts, and the Pedersen opening r_i.
-    //
-    // => Heavy math again → stays on HOST.
     // ─────────────────────────────────────────────────────────────────────────
     let ct_objs = match build_ct_validity_proofs(&skel, &amounts) {
-        Ok(v) => v, // proof *objects* (we also have a fill_* to store raw bytes for fixtures)
+        Ok(v) => v,
         Err(e) => { eprintln!("CT proof build failed: {e}"); return; }
     };
 
-    // Optional: also serialize the CT proofs into the skeleton for JSON fixtures
-    // (Useful when producing wallet-like JSON or parity tests.)
     if let Err(e) = fill_ct_validity_proofs(&mut skel, &amounts) {
         eprintln!("CT proof fill failed: {e}");
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // [HOST] “demo digest”: this is *not* the canonical signing preimage.
-    // We keep it for quick sanity. The *canonical* preimage is derived below
-    // by serializing the real `Transaction` via xelis_common.
+    // [HOST] Generate digest
     // ─────────────────────────────────────────────────────────────────────────
     let digest = digest_for_signing_demo(&skel);
     println!("Digest for signing (SHA512): {}", hex::encode(digest));
 
     // ─────────────────────────────────────────────────────────────────────────
-    // [HOST] Canonical (Core) serialization round-trip with proof objects
-    //
-    // This does three things:
-    //   1) Assemble a real `Transaction` (Transfers variant) using:
-    //        - commitments, CT proofs, fee/nonce/reference, source pk, range proof
-    //        - (For now) a *placeholder* SourceCommitment to satisfy size rules
-    //          — purely structural for the serializer test; not cryptographically valid.
-    //   2) Serialize → Read → Re-serialize, asserting byte-for-byte equality.
-    //   3) Emit the *canonical pre-signature bytes* and a deterministic digest.
-    //
-    // This proves the host can produce the exact blob the Ledger should sign.
+    // [HOST] Canonical serialization and output
     // ─────────────────────────────────────────────────────────────────────────
     use debugger::canonical::verify_commitments_with_sketches;
     match canonical_roundtrip_bytes_with_ct_verbose(&skel, ct_objs) {
         Ok((unsigned_bytes, tx_bytes)) => {
-            // Build minimal preview memo from the same transfers you constructed earlier
+            // Build preview memo
             let memo = build_preview_memo(&skel, &transfers);
 
             verify_commitments_with_sketches(&skel, &transfers);
 
-            // Write XLB1 bundles (memo + canonical bytes)
-            write_bundle("out/poc_tx.unsigned.bundle", &memo, &unsigned_bytes, &skel.output_blinders);
-            write_bundle("out/poc_tx.transaction.bundle", &memo, &tx_bytes, &skel.output_blinders);
-
-            // (Optional) keep raw .bin files too if you still want them
-            // dump_bytes("out/poc_tx.unsigned.bin", &unsigned_bytes);
-            // dump_bytes("out/poc_tx.transaction.bin", &tx_bytes);
+            // Determine output filename based on tx type
+            let tx_type_str = match tx_type {
+                1 => "transfer",
+                2 => "burn",
+                _ => "unknown",
+            };
+            
+            let unsigned_bundle = format!("out/poc_{}.unsigned.bundle", tx_type_str);
+            let tx_bundle = format!("out/poc_{}.transaction.bundle", tx_type_str);
+            
+            // Write XLB1 bundles
+            write_bundle(&unsigned_bundle, &memo, &unsigned_bytes, &skel.output_blinders);
+            write_bundle(&tx_bundle, &memo, &tx_bytes, &skel.output_blinders);
+            
+            println!("\n✅ Successfully generated {} transaction!", tx_type_str);
+            println!("   Unsigned bundle: {}", unsigned_bundle);
+            println!("   Transaction bundle: {}", tx_bundle);
         }
         Err(e) => eprintln!("Canonical round-trip (verbose): {e:#}"),
     }
-
-    // (Optional) If you also want wallet-JSON parity:
-    //  - Use `wallet_json::skel_to_wallet_json(&skel)` to emit a wallet-like JSON
-    //  - Then `compare_with_wallet_json(&skel, "wallet_tx.json")` to assert 1:1 fields.
 }

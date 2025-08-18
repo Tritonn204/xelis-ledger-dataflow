@@ -135,7 +135,7 @@ fn make_xelis_public(pk_can: [u8; 32]) -> Result<PublicKey> {
 fn main() -> Result<()> {
     // dump_generators_from_deps();
     // 1) Load tx → msg64
-    let bundle_path = Path::new("out/poc_tx.unsigned.bundle");
+    let bundle_path = Path::new("out/poc_transfer.unsigned.bundle");
     let (_memo, tx) = read_xlb1(bundle_path)?;
     let msg64 = sha3_512_bytes(&tx);
     println!("Loaded TX: {} bytes", tx.len());

@@ -498,6 +498,7 @@ dependencies = [
  "curve25519-dalek",
  "hex",
  "merlin",
+ "rand",
  "rand_core 0.6.4",
  "serde",
  "serde_json",

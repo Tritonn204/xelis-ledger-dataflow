@@ -5,6 +5,10 @@ const BUNDLE_MAGIC: &[u8; 4] = b"XLB1";
 const BUNDLE_VERSION: u8 = 1;
 const MEMO_PREVIEW_MAX: usize = 64;
 
+// Asset table constants
+const NATIVE_ASSET_INDEX: u8 = 0;
+const NATIVE_ASSET: [u8; 32] = [0u8; 32];
+
 fn leb128_write(mut v: u64, out: &mut Vec<u8>) {
     while v > 0x7F {
         out.push(((v as u8) & 0x7F) | 0x80);
@@ -31,15 +35,39 @@ fn tlv_bytes(tag: u8, bytes: &[u8], out: &mut Vec<u8>) {
     out.extend_from_slice(bytes);
 }
 
-/// Build a minimal, untrusted preview memo for device UI.
+/// Build asset table and return mapping function
+fn build_asset_table(transfers: &[TransferSketch]) -> (Vec<[u8; 32]>, impl Fn(&[u8; 32]) -> u8) {
+    let mut asset_table = Vec::new();
+    let mut asset_map = std::collections::HashMap::new();
+    
+    // Native asset always gets index 0 (not stored in table)
+    asset_map.insert(NATIVE_ASSET, NATIVE_ASSET_INDEX);
+    
+    // Collect unique non-native assets
+    for transfer in transfers {
+        if transfer.asset != NATIVE_ASSET && !asset_map.contains_key(&transfer.asset) {
+            let index = (asset_table.len() + 1) as u8; // +1 because 0 is reserved for native
+            asset_table.push(transfer.asset);
+            asset_map.insert(transfer.asset, index);
+        }
+    }
+    
+    // Return table and lookup closure
+    (asset_table, move |asset: &[u8; 32]| -> u8 {
+        *asset_map.get(asset).unwrap_or(&NATIVE_ASSET_INDEX)
+    })
+}
+
+/// Build a minimal, untrusted preview memo for device UI with asset table optimization.
 /// Device will later re-parse the canonical TX stream and reject on any mismatch.
 /// TLVs included:
 ///   0x01 TX_TYPE (u8)
 ///   0x02 FEE     (u64 LE)
 ///   0x03 NONCE   (u64 LE)
+///   0x04 ASSET_TABLE: count(varint) | asset1(32) | asset2(32) | ...
 ///   0x10 OUT_COUNT (varint-as-payload; no value bytes)
 ///   0x20 OUT_ITEM repeated:
-///        asset(32) | dest_pk(32) | amount(u64 LE) | extra_len(varint) | preview_len(varint) | preview_bytes
+///        asset_index(1) | dest_pk(32) | amount(u64 LE) | extra_len(varint) | preview_len(varint) | preview_bytes
 pub fn build_preview_memo(
     skel: &TxSkeleton,
     transfers: &[TransferSketch],
@@ -48,16 +76,40 @@ pub fn build_preview_memo(
     let tx_type = 1u8;
     let mut memo = Vec::new();
 
+    // Build asset table
+    let (asset_table, get_asset_index) = build_asset_table(transfers);
+    
+    // Write standard fields
     tlv_u8(0x01, tx_type, &mut memo);
     tlv_u64(0x02, skel.fee, &mut memo);
     tlv_u64(0x03, skel.nonce, &mut memo);
 
+    // Write asset table if we have non-native assets
+    if !asset_table.is_empty() {
+        memo.push(0x04); // TAG_ASSET_TABLE
+        
+        // Calculate table size
+        let mut table_data = Vec::new();
+        leb128_write(asset_table.len() as u64, &mut table_data);
+        for asset in &asset_table {
+            table_data.extend_from_slice(asset);
+        }
+        
+        // Write table TLV
+        leb128_write(table_data.len() as u64, &mut memo);
+        memo.extend_from_slice(&table_data);
+        
+        println!("Asset table: {} unique non-native assets", asset_table.len());
+    }
+
+    // Write output count
     let out_count = skel.data_transfers.len() as u64;
     memo.push(0x10);
     leb128_write(out_count, &mut memo); // OUT_COUNT payload = varint itself
 
+    // Write outputs with asset indices
     for (i, t) in skel.data_transfers.iter().enumerate() {
-        let asset = t.asset;
+        let asset_index = get_asset_index(&t.asset);
         let dest = t.destination;
         let amount = transfers[i].amount;
 
@@ -70,10 +122,10 @@ pub fn build_preview_memo(
         let preview_len = core::cmp::min(extra.len(), MEMO_PREVIEW_MAX);
         let extra_preview = &extra[..preview_len];
 
-        // Compose OUT_ITEM value
-        // layout: asset(32) + dest(32) + amount(8) + extra_len(varint) + preview_len(varint) + preview_bytes
-        let mut val = Vec::with_capacity(32 + 32 + 8 + 10 + 10 + preview_len);
-        val.extend_from_slice(&asset);
+        // Compose OUT_ITEM value (now with asset_index instead of full asset)
+        // layout: asset_index(1) + dest(32) + amount(8) + extra_len(varint) + preview_len(varint) + preview_bytes
+        let mut val = Vec::with_capacity(1 + 32 + 8 + 10 + 10 + preview_len);
+        val.push(asset_index);  // Just 1 byte instead of 32!
         val.extend_from_slice(&dest);
         val.extend_from_slice(&amount.to_le_bytes());
         leb128_write(extra_full_len, &mut val);
@@ -85,6 +137,12 @@ pub fn build_preview_memo(
         leb128_write(val.len() as u64, &mut memo);
         memo.extend_from_slice(&val);
     }
+
+    // Log space savings
+    let old_size = out_count as usize * 32; // Old: 32 bytes per asset
+    let new_size = asset_table.len() * 32 + out_count as usize; // New: table + 1 byte per output
+    println!("Memo asset data: {} → {} bytes (saved {} bytes)", 
+        old_size, new_size, old_size.saturating_sub(new_size));
 
     memo
 }
@@ -100,7 +158,7 @@ pub fn write_bundle(
     let mut out = Vec::new();
     
     out.extend_from_slice(BUNDLE_MAGIC);
-    out.push(1); // Version 2 with blinders
+    out.push(BUNDLE_VERSION);
     
     // Memo section
     leb128_write(memo.len() as u64, &mut out);
